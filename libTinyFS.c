@@ -36,9 +36,10 @@ typedef struct {
 } Block;
 
 typedef struct {
-	Block inode;
-	Block buf;
+	int inode;
+	char name[MAX_FILENAME_SIZE];
 	int ptr, size;
+	Block buf;
 } File;
 
 Block superBlock = {0};
@@ -141,7 +142,7 @@ fileDescriptor nextFreeFD() {
 	File* fp;
 	for (int i = 0; i < fileTable.len; i++) {
 		fp = ((File*) fileTable.ptr) + i;
-		if (fp->inode.bNum < 0) {
+		if (fp->inode < 0) {
 			return i;
 		}
 	}
@@ -164,18 +165,18 @@ int nextFreeBlock() {
 	return -1;
 }
 
-int findFile(char* name, File* file) {
+int findFile(File* file) {
 	int n = superBlock.data[4];
 	for (int i = 1; i < n; i++) {
 		if (bitset_is_set(superBlock.data+5, i)) {
 			// Block is free
 			continue;
 		}
-		int err = readBlock(mnt, i, file->inode.data);
+		int err = readBlock(mnt, i, file->buf.data);
 		if (IS_TFS_ERROR(err)) {
 			return err;
 		}
-		if (file->inode.data[0] == BLOCK_INODE && memcmp(file->inode.data+4, name, 8) == 0) {
+		if (file->buf.data[0] == BLOCK_INODE && memcmp(file->buf.data+BLOCK_HEADER_SIZE, file->name, MAX_FILENAME_SIZE) == 0) {
 			return i;
 		}
 	}
@@ -188,38 +189,31 @@ fileDescriptor tfs_openFile(char* name) {
 		return ERR_NAMETOOLONG;
 	}
 	int err, idx;
-	File file = {
-		{0, {BLOCK_INODE, 0x44}},
-		{0, {0}},
-		0,
-		0,
-	};
-	char nameBuf[MAX_FILENAME_SIZE] = {0};
-	memcpy(nameBuf, name, nameSize);
-	int bNum = findFile(nameBuf, &file);
+	File file = {0};
+	memcpy(file.name, name, nameSize);
+	int bNum = findFile(&file);
 	if (bNum < 0) {
 		idx = BLOCK_HEADER_SIZE;
-		memcpy(file.inode.data+idx, nameBuf, MAX_FILENAME_SIZE);
+		memcpy(file.buf.data+idx, file.name, MAX_FILENAME_SIZE);
 		idx += MAX_FILENAME_SIZE;
-		memset(file.inode.data+idx, 0, BLOCKSIZE-idx);
+		memset(file.buf.data+idx, 0, BLOCKSIZE-idx);
 		if ((bNum = nextFreeBlock()) <= 0) {
 			return ERR_NOMEMORY;
 		}
-		file.inode.bNum = bNum;
-		err = writeBlock(mnt, bNum, file.inode.data);
+		err = writeBlock(mnt, bNum, file.buf.data);
 		if (IS_TFS_ERROR(err)) {
 			return err;
 		}
 		bitset_clear(superBlock.data+5, bNum);
 	} else {
 		idx = BLOCK_HEADER_SIZE + MAX_FILENAME_SIZE;
-		file.size = ((uint32_t) file.inode.data[idx])       |
-				    ((uint32_t) file.inode.data[idx+1])<<8  |
-				    ((uint32_t) file.inode.data[idx+2])<<16 |
-				    ((uint32_t) file.inode.data[idx+3])<<24;
+		file.size = ((uint32_t) file.buf.data[idx])       |
+				    ((uint32_t) file.buf.data[idx+1])<<8  |
+				    ((uint32_t) file.buf.data[idx+2])<<16 |
+				    ((uint32_t) file.buf.data[idx+3])<<24;
 	}
-	file.inode.bNum = bNum;
-	memcpy(&file.buf, &file.inode, sizeof(Block));
+	file.inode = bNum;
+	file.buf.bNum = bNum;
 	fileDescriptor fd = nextFreeFD();
 	if (fd < 0) {
 #ifdef DEBUG_FLAG
@@ -237,10 +231,16 @@ fileDescriptor tfs_openFile(char* name) {
 }
 
 int tfs_closeFile(fileDescriptor fd) {
-	if (fd >= fileTable.len || ((File*) fileTable.ptr)[fd].inode.bNum < 0) {
+	if (fd >= fileTable.len) {
 		return ERR_BADF;
 	}
-	((File*) fileTable.ptr)[fd].inode.bNum = -1;
+	File* fp = ((File*) fileTable.ptr) + fd;
+	if (fp->inode <= 0) {
+		return ERR_BADF;
+	}
+	fp->inode = -1;
+	fp->buf.bNum = -1;
+	memset(fp->buf.data, 0, BLOCKSIZE);
 	if (nextFD < 0) {
 		nextFD = fd;
 	}
@@ -248,32 +248,18 @@ int tfs_closeFile(fileDescriptor fd) {
 }
 
 int tfs_writeFile(fileDescriptor fd, char* buffer, int size) {
-	if (fd >= fileTable.len || ((File*) fileTable.ptr)[fd].inode.bNum < 0) {
+	if (fd >= fileTable.len) {
 		return ERR_BADF;
 	}
 	File* fp = ((File*) fileTable.ptr) + fd;
-	int bNum = fp->inode.bNum;
+	int bNum = fp->inode;
 	if (bNum <= 0) {
 		return ERR_BADF;
 	}
-	int off = BLOCK_HEADER_SIZE + MAX_FILENAME_SIZE;
-	fp->inode.data[off] = size;
-	fp->inode.data[off+1] = size >> 8;
-	fp->inode.data[off+2] = size >> 16;
-	fp->inode.data[off+3] = size >> 24;
-	off = INODE_HEADER_SIZE;
-	int nBytes = BLOCKSIZE - off;
-	int n = size < nBytes ? size : nBytes;
-	memcpy(fp->inode.data+off, buffer, n * sizeof(char));
-	int err = writeBlock(mnt, bNum, fp->inode.data);
-	if (IS_TFS_ERROR(err)) {
-		return err;
-	}
-	buffer += n;
-	off = BLOCK_HEADER_SIZE;
-	nBytes = BLOCKSIZE - off;
-	bNum = fp->inode.data[2];
-	size -= nBytes;
+	int oldSize = fp->size;
+	fp->size = size;
+	int err, off = BLOCK_HEADER_SIZE;
+	int n, nBytes = BLOCKSIZE - off;
 	while (size > 0) {
 		if (bNum > 0) {
 			err = readBlock(mnt, bNum, fp->buf.data);
@@ -282,21 +268,32 @@ int tfs_writeFile(fileDescriptor fd, char* buffer, int size) {
 			}
 		} else {
 			bNum = nextFreeBlock();
+			fp->buf.data[0] = BLOCK_EXTENT;
+			fp->buf.data[2] = 0;
 		}
-		n = size < nBytes ? size : nBytes;
-		memcpy(fp->buf.data+off, buffer, n * sizeof(char));
+		if (bNum == fp->inode) {
+			off = BLOCK_HEADER_SIZE + MAX_FILENAME_SIZE;
+			fp->buf.data[off++] = size;
+			fp->buf.data[off++] = size>>8;
+			fp->buf.data[off++] = size>>16;
+			fp->buf.data[off++] = size>>24;
+			n = (size < (BLOCKSIZE-INODE_HEADER_SIZE)) ? size : (BLOCKSIZE-INODE_HEADER_SIZE);
+			memcpy(fp->buf.data+off, buffer, n * sizeof(char));
+			off = BLOCK_HEADER_SIZE;
+		} else {
+			n = size < nBytes ? size : nBytes;
+			memcpy(fp->buf.data+off, buffer, n * sizeof(char));
+		}
 		err = writeBlock(mnt, bNum, fp->buf.data);
 		if (IS_TFS_ERROR(err)) {
 			return err;
 		}
 		bitset_clear(superBlock.data+5, bNum);
 		bNum = fp->buf.data[2];
-		size -= nBytes;
+		size -= n;
 		buffer += n;
 	}
-	fp->size = size;
 	fp->ptr = 0;
-	memcpy(&fp->buf, &fp->inode, sizeof(Block));
 	return 0;
 }
 
@@ -305,10 +302,10 @@ int tfs_deleteFile(fileDescriptor fd) {
 		return ERR_BADF;
 	}
 	File* fp = ((File*) fileTable.ptr) + fd;
-	if (fp->inode.bNum <= 0) {
+	if (fp->inode <= 0) {
 		return ERR_BADF;
 	}
-	int err, bNum = fp->inode.bNum;
+	int err, bNum = fp->inode;
 	while (bNum > 0) {
 		err = readBlock(mnt, bNum, fp->buf.data);
 		if (IS_TFS_ERROR(err)) {
@@ -326,7 +323,7 @@ int tfs_deleteFile(fileDescriptor fd) {
 		bNum = fp->buf.data[2];
 	}
 
-	return 0;
+	return tfs_closeFile(fd);
 }
 
 int tfs_readByte(fileDescriptor fd, char* buffer) {
@@ -334,14 +331,22 @@ int tfs_readByte(fileDescriptor fd, char* buffer) {
 		return ERR_BADF;
 	}
 	File* fp = ((File*) fileTable.ptr) + fd;
-	if (fp->inode.bNum <= 0) {
+	if (fp->inode <= 0) {
 		return ERR_BADF;
 	}
 	if (fp->ptr >= fp->size) {
 		return ERR_FAULT;
 	}
-	int off = fp->buf.bNum == fp->inode.bNum ? INODE_HEADER_SIZE : BLOCK_HEADER_SIZE;
-	int err, idx = (fp->ptr + off) % BLOCKSIZE;
+	int err;
+	if (fp->ptr == 0 && fp->buf.bNum != fp->inode) {
+		err = readBlock(mnt, fp->inode, fp->buf.data);
+		if (IS_TFS_ERROR(err)) {
+			return err;
+		}
+		fp->buf.bNum = fp->inode;
+	}
+	int off = (fp->buf.bNum == fp->inode) ? INODE_HEADER_SIZE : BLOCK_HEADER_SIZE;
+	int idx = (fp->ptr + off) % BLOCKSIZE;
 	if (idx < off) {
 		// Read next block of file
 		int next = fp->buf.data[2];
@@ -364,7 +369,7 @@ int tfs_seek(fileDescriptor fd, int offset) {
 		return ERR_BADF;
 	}
 	File* fp = ((File*) fileTable.ptr) + fd;
-	if (fp->inode.bNum <= 0) {
+	if (fp->inode <= 0) {
 		return ERR_BADF;
 	}
 	if (offset == fp->ptr) {
