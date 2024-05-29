@@ -1,11 +1,20 @@
+#ifdef DEBUG_FLAG
+	#include <stdio.h>
+#endif
 #include "bitset.h"
 
 void bitset_set(uint8_t* set, int idx) {
 	set[idx>>3] |= 1<<(idx&7);
+#ifdef DEBUG_FLAG
+	printf("set bit %d\n", idx);
+#endif
 }
 
 void bitset_clear(uint8_t* set, int idx) {
 	set[idx>>3] &= ~(1<<(idx&7));
+#ifdef DEBUG_FLAG
+	printf("cleared bit %d\n", idx);
+#endif
 }
 
 int bitset_is_set(uint8_t* set, int idx) {

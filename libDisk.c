@@ -31,6 +31,9 @@ int openDisk(char* filename, int nBytes) {
 		close(fd);
 		return err;
 	}
+#ifdef DEBUG_FLAG
+	printf("Opened Disk #%d\n\t%d bytes\n", fd, nBytes);
+#endif
 	return fd;
 }
 
@@ -38,6 +41,9 @@ int closeDisk(int disk) {
 	if (close(disk) == -1) {
 		return tfs_error(errno);
 	}
+#ifdef DEBUG_FLAG
+	printf("Closed Disk #%d\n", disk);
+#endif
 	return 0;
 }
 
@@ -60,6 +66,9 @@ int readBlock(int disk, int bNum, void* block) {
 	if (pread(disk, block, BLOCKSIZE, off) == -1) {
 		return tfs_error(errno);
 	}
+#ifdef DEBUG_FLAG
+	printf("Read Block #%d\n\tType: %d\n", bNum, *(char*)block);
+#endif
 	return 0;
 }
 
