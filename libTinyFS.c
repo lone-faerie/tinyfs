@@ -11,6 +11,12 @@
 #include "slice.h"
 #include "bitset.h"
 
+#ifdef DEBUG_FLAG
+	#define dbg(...) fprintf(stderr, __VA_ARGS__)
+#else
+	#define dbg(...)
+#endif
+
 #define BLOCK_SUPER 1
 #define BLOCK_INODE 2
 #define BLOCK_EXTENT 3
@@ -20,6 +26,8 @@
 #define BLOCK_HEADER_SIZE 4
 #define MAX_FILENAME_SIZE 8
 #define INODE_HEADER_SIZE (BLOCK_HEADER_SIZE + MAX_FILENAME_SIZE + sizeof(int))
+#define BLOCK_DATA_SIZE (BLOCKSIZE - BLOCK_HEADER_SIZE)
+#define INODE_DATA_SIZE (BLOCKSIZE - INODE_HEADER_SIZE)
 
 #define IS_BAD_BLOCK(blk) ((blk)[0] > BLOCK_FREE && (blk)[1] != 0x44 && (blk)[2] != 0)
 
@@ -74,9 +82,7 @@ int tfs_mkfs(char* filename, int nBytes) {
 	if (IS_TFS_ERROR(err)) {
 		return err;
 	}
-#ifdef DEBUG_FLAG
-	printf("made fs of %d blocks\n", nBlocks);
-#endif
+	dbg("made fs of %d blocks\n", nBlocks);
 	return 0;
 }
 
@@ -163,9 +169,7 @@ int nextFreeBlock() {
 		return next;
 	}
 	next = bitset_ctz(superBlock.data+5, superBlock.data[4]);
-#ifdef DEBUG_FLAG
-	printf("next free block: %d\n", next);
-#endif
+	dbg("next free block: %d\n", next);
 	if (next < superBlock.data[4]<<3) {
 		return next;
 	}
@@ -177,9 +181,7 @@ int findFile(File* file) {
 	for (int i = 1; i < n; i++) {
 		if (bitset_is_set(superBlock.data+5, i)) {
 			// Block is free
-#ifdef DEBUG_FLAG
-			printf("block %d is free, skipping\n", i);
-#endif
+			dbg("block %d is free, skipping\n", i);
 			continue;
 		}
 		int err = readBlock(mnt, i, file->buf.data);
@@ -187,16 +189,12 @@ int findFile(File* file) {
 			return err;
 		}
 		int cmp = memcmp(file->buf.data+BLOCK_HEADER_SIZE, file->name, MAX_FILENAME_SIZE);
-#ifdef DEBUG_FLAG
-		printf("'%s' vs. '%s': %d\n", file->buf.data+BLOCK_HEADER_SIZE, file->name, cmp);
-#endif
+		dbg("'%s' vs. '%s': %d\n", file->buf.data+BLOCK_HEADER_SIZE, file->name, cmp);
 		if (file->buf.data[0] == BLOCK_INODE && cmp == 0) {
 			return i;
 		}
 	}
-#ifdef DEBUG_FLAG
-	printf("file %s not found\n", file->name);
-#endif
+	dbg("file %s not found\n", file->name);
 	return -1;
 }
 
@@ -224,9 +222,7 @@ fileDescriptor tfs_openFile(char* name) {
 		bitset_clear(superBlock.data+5, bNum);
 	} else {
 		idx = BLOCK_HEADER_SIZE + MAX_FILENAME_SIZE;
-#ifdef DEBUG_FLAG
-		printf("size offset: %d\n", idx);
-#endif
+		dbg("size offset: %d\n", idx);
 		file.size = ((uint32_t) file.buf.data[idx])       |
 				    ((uint32_t) file.buf.data[idx+1])<<8  |
 				    ((uint32_t) file.buf.data[idx+2])<<16 |
@@ -236,17 +232,13 @@ fileDescriptor tfs_openFile(char* name) {
 	file.buf.bNum = bNum;
 	fileDescriptor fd = nextFreeFD();
 	if (fd < 0) {
-#ifdef DEBUG_FLAG
-		printf("appending\n");
-#endif
+		dbg("appending\n");
 		fd = fileTable.len;
 		fileTable = slice_append(fileTable, &file);
 	} else {
 		memcpy(((File*) fileTable.ptr) + fd, &file, sizeof(File));
 	}
-#ifdef DEBUG_FLAG
-	printf("%s opened with fd %d (size %d)\n", name, fd, file.size);
-#endif
+	dbg("%s opened with fd %d (size %d)\n", name, fd, file.size);
 	return fd;
 }
 
@@ -303,24 +295,18 @@ int tfs_writeFile(fileDescriptor fd, char* buffer, int size) {
 	int next;
 	fp->size = size;
 	int err, off = BLOCK_HEADER_SIZE;
-	int n, nBytes = BLOCKSIZE - off;
+	int n, nBytes = BLOCK_DATA_SIZE;
 	while (size > 0 && bNum > 0) {
 		err = readBlock(mnt, bNum, fp->buf.data);
 		if (IS_TFS_ERROR(err)) {
 			return err;
 		}
-#ifdef DEBUG_FLAG
-		printf("read block %d\n", bNum);
-#endif
+		dbg("read block %d\n", bNum);
 		if (bNum == fp->inode) {
-#ifdef DEBUG_FLAG
-			printf("writing inode (size %d)\n", size);
-#endif
+			dbg("writing inode (size %d)\n", size);
 			off = BLOCK_HEADER_SIZE + MAX_FILENAME_SIZE;
 			fp->buf.data[0] = BLOCK_INODE;
-#ifdef DEBUG_FLAG
-			printf("size offset: %d\n", off);
-#endif
+			dbg("size offset: %d\n", off);
 			fp->buf.data[off++] = size;
 			fp->buf.data[off++] = size>>8;
 			fp->buf.data[off++] = size>>16;
@@ -335,32 +321,22 @@ int tfs_writeFile(fileDescriptor fd, char* buffer, int size) {
 		}
 		next = fp->buf.data[2];
 		if (size <= n) {
-#ifdef DEBUG_FLAG
-			printf("final block of file\n");
-#endif
+			dbg("final block of file\n");
 			fp->buf.data[2] = 0;
 		} else if (next <= 0) {
-#ifdef DEBUG_FLAG
-			printf("need free block\n");
-#endif
+			dbg("need free block\n");
 			if ((next = nextFreeBlock()) <= 0) {
-#ifdef DEBUG_FLAG
-				printf("error getting next free block\n");
-#endif
+				dbg("error getting next free block\n");
 				return ERR_NOMEMORY;
 			}
 			fp->buf.data[2] = next;
 		}
-#ifdef DEBUG_FLAG
-		printf("next block: %d\n", next);
-#endif
+		dbg("next block: %d\n", next);
 		err = writeBlock(mnt, bNum, fp->buf.data);
 		if (IS_TFS_ERROR(err)) {
 			return err;
 		}
-#ifdef DEBUG_FLAG
-		printf("wrote block %d\n", bNum);
-#endif
+		dbg("wrote block %d\n", bNum);
 		bitset_clear(superBlock.data+5, bNum);
 		if (next > 0) {
 			bitset_clear(superBlock.data+5, next);
@@ -396,29 +372,19 @@ int tfs_deleteFile(fileDescriptor fd) {
 }
 
 int tfs_readByte(fileDescriptor fd, char* buffer) {
-#ifdef DEBUG_FLAG
-	printf("reading byte\n");
-#endif
+	dbg("reading byte\n");
 	if (fd >= fileTable.len) {
-#ifdef DEBUG_FLAG
-		printf("bad fd %d\n", fd);
-#endif
+		dbg("bad fd %d\n", fd);
 		return ERR_BADF;
 	}
 	File* fp = ((File*) fileTable.ptr) + fd;
 	if (fp->inode <= 0) {
-#ifdef DEBUG_FLAG
-		printf("bad inode %d\n", fp->inode);
-#endif
+		dbg("bad inode %d\n", fp->inode);
 		return ERR_BADF;
 	}
-#ifdef DEBUG_FLAG
-	printf("reading byte %d\n", fp->ptr);
-#endif
+	dbg("reading byte %d\n", fp->ptr);
 	if (fp->ptr >= fp->size) {
-#ifdef DEBUG_FLAG
-		printf("bad ptr %d (size %d)\n", fp->ptr, fp->size);
-#endif
+		dbg("bad ptr %d (size %d)\n", fp->ptr, fp->size);
 		return ERR_FAULT;
 	}
 	int err;
@@ -429,17 +395,20 @@ int tfs_readByte(fileDescriptor fd, char* buffer) {
 		}
 		fp->buf.bNum = fp->inode;
 	}
-	int off = (fp->buf.bNum == fp->inode) ? INODE_HEADER_SIZE : BLOCK_HEADER_SIZE;
-	int idx = (fp->ptr + off) % BLOCKSIZE;
-#ifdef DEBUG_FLAG
-	printf("off: %d, idx: %d\n", off, idx);
-#endif
-	if (idx < off) {
-#ifdef DEBUG_FLAG
-		printf("Read next block\n");
-#endif
+	int off, idx = fp->ptr;
+	if (idx < INODE_DATA_SIZE) {
+		off = INODE_HEADER_SIZE;
+	} else {
+		idx = (fp->ptr - INODE_DATA_SIZE) % BLOCK_DATA_SIZE;
+		off = BLOCK_HEADER_SIZE;
+	}
+	idx += off;
+	dbg("off: %d, idx: %d\n", off, idx);
+	*buffer = fp->buf.data[idx];
+	if (idx >= BLOCKSIZE - 1) {
 		// Read next block of file
 		int next = fp->buf.data[2];
+		dbg("Read next block %d\n", next);
 		if (next <= 0) {
 			return ERR_FAULT;
 		}
@@ -449,7 +418,6 @@ int tfs_readByte(fileDescriptor fd, char* buffer) {
 		}
 		fp->buf.bNum = next;
 	}
-	*buffer = fp->buf.data[idx];
 	++fp->ptr;
 	return 0;
 }
