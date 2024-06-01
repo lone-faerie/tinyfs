@@ -1,8 +1,8 @@
 #ifndef TINYFS_ERRNO_H
 #define TINYFS_ERRNO_H
 
-/* Unknown error */
-#define ERR_UNKNOWN -1
+/* End of file */
+#define ERR_EOF -1
 /* Permission denied */
 #define ERR_ACCESS -2
 /* Resource temporarily unavailable */
@@ -39,6 +39,8 @@
 #define ERR_SEEKPIPE -18
 /* Text file busy */
 #define ERR_TXTBUSY -19
+/* Unknown error */
+#define ERR_UNKNOWN -128
 
 #define IS_TFS_ERROR(err) ((err) < 0 && (err) >= ERR_TXTBUSY)
 

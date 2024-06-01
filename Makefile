@@ -18,4 +18,4 @@ tfsTest: $(OBJS)
 	gcc -c $(CFLAGS) $< -o $@
 
 clean:
-	rm -f diskTest tfsTest *.o
+	rm -f diskTest tfsTest *.o tinyFSDisk

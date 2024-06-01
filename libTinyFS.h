@@ -43,12 +43,21 @@ int tfs_deleteFile(fileDescriptor fd);
 /* reads one byte from the file and copies it to buffer, using the
 current file pointer location and incrementing it by one upon success.
 If the file pointer is already past the end of the file then
-tfs_readByte() should return an error and not increment the file pointer.
-*/
+tfs_readByte() should return an error and not increment the file pointer. */
 int tfs_readByte(fileDescriptor fd, char* buffer);
 
 /* change the file pointer location to offset (absolute). Returns
 success/error codes. */
 int tfs_seek(fileDescriptor fd, int offset);
+
+/* creates a directory, name could contain a "/"-delimited path. */
+int tfs_createDir(char* dirName);
+
+/* deletes an empty directory */
+int tfs_removeDir(char* dirName);
+
+/* recursively remove dirName and any files and directories under it.
+Special "/" token may be used to indicate root dir. */
+int tfs_removeAll(char* dirName);
 
 #endif

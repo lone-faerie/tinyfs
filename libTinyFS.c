@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,14 +23,25 @@
 #define BLOCK_EXTENT 3
 #define BLOCK_FREE 4
 
+#define FLAG_ISDIR 1
+#define FLAG_WRITE 2
+#define FLAG_READ 4
+#define FLAGS_RDWR (FLAG_READ | FLAG_WRITE)
+#define FLAGS_DIR (FLAG_ISDIR | FLAGS_RDWR)
+
+#define SUPER_ADDRESS 0
+#define ROOT_ADDRESS 1
+#define START_ADDRESS (ROOT_ADDRESS + 1)
+
 #define DEFAULT_TABLE_SIZE 32
 #define BLOCK_HEADER_SIZE 4
 #define MAX_FILENAME_SIZE 8
-#define INODE_HEADER_SIZE (BLOCK_HEADER_SIZE + MAX_FILENAME_SIZE + sizeof(int))
+#define INODE_HEADER_SIZE (BLOCK_HEADER_SIZE + 1 + MAX_FILENAME_SIZE + sizeof(int) + 1)
 #define BLOCK_DATA_SIZE (BLOCKSIZE - BLOCK_HEADER_SIZE)
 #define INODE_DATA_SIZE (BLOCKSIZE - INODE_HEADER_SIZE)
+#define MAX_DISK_SIZE (BLOCKSIZE * (UCHAR_MAX+1))
 
-#define IS_BAD_BLOCK(blk) ((blk)[0] > BLOCK_FREE && (blk)[1] != 0x44 && (blk)[2] != 0)
+#define IS_BAD_BLOCK(blk) ((blk)[0] > BLOCK_FREE || (blk)[1] != 0x44 || (blk)[3] != 0)
 
 /* Mounted disk number */
 int mnt = -1;
@@ -44,14 +56,44 @@ typedef struct {
 } Block;
 
 typedef struct {
-	int inode;
+	int inode, dir;
 	char name[MAX_FILENAME_SIZE];
+	uint8_t flags;
 	int ptr, size;
 	Block buf;
 } File;
 
 Block superBlock = {0};
 int nextBlock = -1;
+
+File rootDir = {0};
+int nextRoot = -1;
+
+int _tfs_seek(File* fp, int offset);
+
+int _readBlock(int bNum, Block* block) {
+	if (mnt < 0) {
+		return ERR_BADF;
+	}
+	int err = readBlock(mnt, bNum, block->data);
+	if (IS_TFS_ERROR(err)) {
+		return err;
+	}
+	block->bNum = bNum;
+	return 0;
+}
+
+int _writeBlock(int bNum, Block* block) {
+	if (mnt < 0) {
+		return ERR_BADF;
+	}
+	int err = writeBlock(mnt, bNum, block->data);
+	if (IS_TFS_ERROR(err)) {
+		return err;
+	}
+	return 0;
+}
+
 
 int tfs_mkfs(char* filename, int nBytes) {
 	int nBlocks = nBytes / BLOCKSIZE;
@@ -62,23 +104,38 @@ int tfs_mkfs(char* filename, int nBytes) {
 	/* Initialize free blocks */
 	uint8_t block[BLOCKSIZE] = {BLOCK_FREE, 0x44};
 	int i, err;
-	for (i = 1; i < nBlocks; i++) {
+	for (i = START_ADDRESS; i < nBlocks; i++) {
 		err = writeBlock(disk, i, block);
 		if (IS_TFS_ERROR(err)) {
 			return err;
 		}
 	}
+	/* Initialize root directory */
+	block[0] = BLOCK_INODE;
+	block[INODE_HEADER_SIZE-1] = FLAGS_DIR;
+	err = writeBlock(disk, ROOT_ADDRESS, block);
+	if (IS_TFS_ERROR(err)) {
+		return err;
+	}
+	dbg("wrote root [%d, %d, %d, %d]\n", block[0], block[1], block[2], block[3]);
+	block[INODE_HEADER_SIZE-1] = 0;
 	/* Initialize superblock */
 	block[0] = BLOCK_SUPER;
+	block[2] = ROOT_ADDRESS;
 	int n = (nBlocks + 7) >> 3; // num. bytes needed to represent each block as a bit
-	block[4] = (uint8_t) n;
+	dbg("bitset of %d bytes\n", n);
+	block[4] = (uint8_t) nBlocks;
 	n += 5;
 	for (i = 5; i < n; i++) {
 		block[i] = 0xff;
 	}
 	block[n-1] >>= (8 - (nBlocks & 7)) & 7;
-	block[5] &= ~1;
-	err = writeBlock(disk, 0, block);
+	block[5] &= 0xff << START_ADDRESS;
+	err = writeBlock(disk, SUPER_ADDRESS, block);
+	if (IS_TFS_ERROR(err)) {
+		return err;
+	}
+	err = closeDisk(disk);
 	if (IS_TFS_ERROR(err)) {
 		return err;
 	}
@@ -87,26 +144,19 @@ int tfs_mkfs(char* filename, int nBytes) {
 }
 
 int tfs_verify(void) {
-	superBlock.bNum = 0;
-	int err = readBlock(mnt, 0, superBlock.data);
-	if (IS_TFS_ERROR(err)) {
-		return err;
-	}
-	if (IS_BAD_BLOCK(superBlock.data) || superBlock.data[0] != BLOCK_SUPER) {
-		return ERR_INVALID;
-	}
 	uint8_t block[BLOCKSIZE];
-	int n = superBlock.data[4];
-	for (int i = 1; i < n; i++) {
+	int err, n = superBlock.data[4];
+	for (int i = START_ADDRESS; i < n; i++) {
 		err = readBlock(mnt, i, block);
 		if (IS_TFS_ERROR(err)) {
 			return err;
 		}
 		if (IS_BAD_BLOCK(block)) {
+			dbg("bad block %d [%d, %d, %d, %d]\n", i, block[0], block[1], block[2], block[3]);
 			return ERR_INVALID;
 		}
 	}
-	return err == ERR_INVALID ? 0 : err;
+	return err;
 }
 
 int tfs_mount(char* diskname) {
@@ -114,16 +164,47 @@ int tfs_mount(char* diskname) {
 		// Another disk is already mounted
 		return ERR_TXTBUSY;
 	}
-	int retValue;
-	if ((retValue = openDisk(diskname, 0)) < 0) {
+	int retValue = openDisk(diskname, 0);
+	if (IS_TFS_ERROR(retValue)) {
+		dbg("could not open disk\n");
 		return retValue;
 	}
 	mnt = retValue;
-	if ((retValue = tfs_verify()) < 0) {
+	retValue = readBlock(mnt, SUPER_ADDRESS, superBlock.data);
+	if (IS_TFS_ERROR(retValue)) {
+		dbg("error reading superblock\n");
 		return retValue;
 	}
+	if (IS_BAD_BLOCK(superBlock.data) || superBlock.data[0] != BLOCK_SUPER || superBlock.data[2] != 1) {
+		dbg("bad superblock\n");
+		return ERR_INVALID;
+	}
+	superBlock.bNum = SUPER_ADDRESS;
+	retValue = tfs_verify();
+	if (IS_TFS_ERROR(retValue)) {
+		dbg("invalid FS\n");
+		return retValue;
+	}
+	retValue = readBlock(mnt, ROOT_ADDRESS, rootDir.buf.data);
+	if (IS_TFS_ERROR(retValue)) {
+		dbg("error reading root\n");
+		return retValue;
+	}
+	rootDir.buf.bNum = ROOT_ADDRESS;
+	rootDir.inode = ROOT_ADDRESS;
+	int off = BLOCK_HEADER_SIZE;
+	rootDir.dir = rootDir.buf.data[off];
+	off += 1;
+	memcpy(rootDir.name, rootDir.buf.data+off, MAX_FILENAME_SIZE);
+	off += MAX_FILENAME_SIZE;
+	rootDir.size = ((uint32_t) rootDir.buf.data[off])       |
+			       ((uint32_t) rootDir.buf.data[off+1])<<8  |
+			       ((uint32_t) rootDir.buf.data[off+2])<<16 |
+			       ((uint32_t) rootDir.buf.data[off+3])<<24;
+	rootDir.flags = rootDir.buf.data[off+4];
+	rootDir.ptr = 0;
 	fileTable = slice_new(DEFAULT_TABLE_SIZE, sizeof(File));
-
+	dbg("%d free blocks\n", bitset_popcnt(superBlock.data+5, superBlock.data[4]));
 	return 0;
 }
 
@@ -131,7 +212,11 @@ int tfs_unmount(void) {
 	if (mnt < 0) {
 		return ERR_BADF;
 	}
-	int err = writeBlock(mnt, 0, superBlock.data);
+	int err = writeBlock(mnt, SUPER_ADDRESS, superBlock.data);
+	if (IS_TFS_ERROR(err)) {
+		return err;
+	}
+	err = writeBlock(mnt, ROOT_ADDRESS, rootDir.buf.data);
 	if (IS_TFS_ERROR(err)) {
 		return err;
 	}
@@ -144,6 +229,21 @@ int tfs_unmount(void) {
 	nextBlock = -1;
 	slice_free(fileTable);
 	return 0;
+}
+
+/* Number of blocks into a file where ptr resides. (i.e. ptr < 240 = 0, ptr < 492 = 1, etc.) */
+static inline int blockNum(int ptr) {
+	return ((ptr - INODE_DATA_SIZE) / BLOCK_DATA_SIZE) + (ptr >= INODE_DATA_SIZE);
+}
+
+int ptrIndex(int ptr, int* off) {
+	if (ptr < INODE_DATA_SIZE) {
+		if (off) *off = INODE_HEADER_SIZE;
+		return ptr + INODE_HEADER_SIZE;
+	}
+	if (off) *off = BLOCK_HEADER_SIZE;
+	ptr = (ptr - INODE_DATA_SIZE) % BLOCK_DATA_SIZE;
+	return ptr + BLOCK_HEADER_SIZE;
 }
 
 fileDescriptor nextFreeFD() {
@@ -176,7 +276,136 @@ int nextFreeBlock() {
 	return -1;
 }
 
+int nextFile(File* dir, char** name) {
+	dbg("next file in /\n");
+	int off;
+	int idx = ptrIndex(dir->ptr, &off);
+	int nBytes = BLOCKSIZE - idx;
+	if (nBytes < MAX_FILENAME_SIZE+1) {
+		int bNum = dir->buf.data[2];
+		if (bNum <= 0) {
+			return ERR_EOF;
+		}
+		int err = readBlock(mnt, bNum, dir->buf.data);
+		if (IS_TFS_ERROR(err)) {
+			dbg("error reading block\n");
+			return err;
+		}
+		dir->buf.bNum = bNum;
+		dir->ptr += nBytes;
+		idx = BLOCK_HEADER_SIZE;
+	}
+	int addr = dir->buf.data[idx + MAX_FILENAME_SIZE];
+	*name = (char*) (dir->buf.data + idx);
+	dir->ptr += MAX_FILENAME_SIZE + 1;
+	return addr;
+}
+
+int getFile(fileDescriptor fd, File** fp) {
+	if (mnt < 0) {
+		return ERR_IO;
+	} else if (fd >= fileTable.len) {
+		return ERR_BADF;
+	}
+	*fp = ((File*) fileTable.ptr) + fd;
+	if ((*fp)->inode <= 0) {
+		return ERR_BADF;
+	}
+	return 0;
+}
+
 int findFile(File* file) {
+	dbg("finding file\n");
+	int err;
+	if (rootDir.buf.bNum != rootDir.inode) {
+		dbg("reading root dir\n");
+		err = readBlock(mnt, rootDir.inode, rootDir.buf.data);
+		if (IS_TFS_ERROR(err)) {
+			return err;
+		}
+		rootDir.buf.bNum = rootDir.inode;
+	}
+	rootDir.ptr = 0;
+	char* name;
+	int bNum, firstFree = -1;
+	while ((bNum = nextFile(&rootDir, &name)) >= 0) {
+		if (bNum == 0 && firstFree != -1) {
+			firstFree = rootDir.ptr - (MAX_FILENAME_SIZE + 1);
+		} else if (strncmp(file->name, name, MAX_FILENAME_SIZE) == 0) {
+			break;
+		}
+//		rootDir.ptr += MAX_FILENAME_SIZE + 1;
+	}
+	if (IS_TFS_ERROR(bNum)) {
+		dbg("file not found!\n");
+		return bNum;
+	}
+	dbg("file found!\n");
+	err = readBlock(mnt, bNum, file->buf.data);
+	if (IS_TFS_ERROR(err)) {
+		return err;
+	}
+	file->buf.bNum = bNum;
+	file->inode = bNum;
+	file->ptr = 0;
+	int idx = BLOCK_HEADER_SIZE + MAX_FILENAME_SIZE;
+	file->dir = file->buf.data[idx];
+	file->size = ((uint32_t) file->buf.data[idx+1])       |
+				 ((uint32_t) file->buf.data[idx+2])<<8  |
+				 ((uint32_t) file->buf.data[idx+3])<<16 |
+				 ((uint32_t) file->buf.data[idx+4])<<24;
+	file->flags = file->buf.data[idx+5];
+	return bNum;
+}
+
+int findFileInDir(char* name, File* file, File* dir) {
+	dbg("finding file\n");
+	int err;
+	if (dir->buf.bNum != dir->inode) {
+		dbg("reading root dir\n");
+		err = readBlock(mnt, dir->inode, dir->buf.data);
+		if (IS_TFS_ERROR(err)) {
+			return err;
+		}
+		dir->buf.bNum = dir->inode;
+	}
+	dir->ptr = 0;
+	char* namep;
+	int bNum, firstFree = -1;
+	while ((bNum = nextFile(dir, &namep)) >= 0) {
+		if (bNum == 0 && firstFree != -1) {
+			firstFree = dir->ptr;
+		} else if (strncmp(name, namep, MAX_FILENAME_SIZE) == 0) {
+			break;
+		}
+//		dir->ptr += MAX_FILENAME_SIZE + 1;
+	}
+	if (bNum == ERR_EOF && firstFree != -1) {
+		dbg("file not found!\n");
+		return _tfs_seek(dir, firstFree);
+	} else if (IS_TFS_ERROR(bNum)) {
+		return bNum;
+	} else {
+		dbg("file found!\n");
+		err = readBlock(mnt, bNum, file->buf.data);
+		if (IS_TFS_ERROR(err)) {
+			return err;
+		}
+	}
+	file->buf.bNum = bNum;
+	file->inode = bNum;
+	file->ptr = 0;
+	int idx = BLOCK_HEADER_SIZE + MAX_FILENAME_SIZE;
+	file->dir = file->buf.data[idx];
+	file->size = ((uint32_t) file->buf.data[idx+1])       |
+				 ((uint32_t) file->buf.data[idx+2])<<8  |
+				 ((uint32_t) file->buf.data[idx+3])<<16 |
+				 ((uint32_t) file->buf.data[idx+4])<<24;
+	file->flags = file->buf.data[idx+5];
+	return bNum;
+}
+
+int _findFile(File* file) {
 	int n = superBlock.data[4];
 	for (int i = 1; i < n; i++) {
 		if (bitset_is_set(superBlock.data+5, i)) {
@@ -198,19 +427,119 @@ int findFile(File* file) {
 	return -1;
 }
 
+int findOrMakeFile(char* name, File* dir) {
+	int err;
+	if (dir->buf.bNum != dir->inode) {
+		err = readBlock(mnt, dir->inode, dir->buf.data);
+		if (IS_TFS_ERROR(err)) {
+			return err;
+		}
+		dir->buf.bNum = dir->inode;
+	}
+	dir->ptr = 0;
+	int bNum, firstFree = -1;
+	char* entry;
+	while ((bNum = nextFile(dir, &entry)) >= 0) {
+		if (bNum == 0 && firstFree == -1) {
+			firstFree = dir->ptr - (MAX_FILENAME_SIZE + 1);
+		} else if (strncmp(name, entry, MAX_FILENAME_SIZE) == 0) {
+			return bNum;
+		}
+	}
+	if (IS_TFS_ERROR(bNum) && bNum != ERR_EOF) {
+		return bNum;
+	} else if (firstFree == -1) {
+		return ERR_NOMEMORY;
+	}
+	err = _tfs_seek(dir, firstFree);
+	if (IS_TFS_ERROR(err)) {
+		return err;
+	}
+	bNum = nextFreeBlock();
+	if (bNum <= 0) {
+		return ERR_NOMEMORY;
+	}
+	int off, idx;
+	idx = ptrIndex(firstFree, &off);
+	int nameLen = strlen(name);
+	memcpy(dir->buf.data+idx, name, nameLen);
+	dir->buf.data[idx+MAX_FILENAME_SIZE] = bNum;
+	err = writeBlock(mnt, dir->buf.bNum, dir->buf.data);
+	if (IS_TFS_ERROR(err)) {
+		return err;
+	}
+	return bNum;
+}
+
+int openDir(char* path, File* dir) {
+	int nameSize;
+	char* name = strtok(path, "/");
+	while (name) {
+		nameSize = strlen(name);
+		if (nameSize == 0) {
+			return ERR_INVALID;
+		} else if (nameSize > MAX_FILENAME_SIZE) {
+			return ERR_NAMETOOLONG;
+		}
+
+		// do something
+
+		name = strtok(NULL, "/");
+	}
+	return 0;
+}
+
 fileDescriptor tfs_openFile(char* name) {
+	dbg("opening %s\n", name);
+	int pathLen = strlen(name);
+	if (pathLen == 0) {
+		return ERR_INVALID;
+	}
+	if (name[0] == '/') {
+		if (pathLen == 1) {
+			return ERR_INVALID;
+		}
+		++name;
+		--pathLen;
+	}
+	if (name[pathLen-1] == '/') {
+		if (pathLen == 1) {
+			return ERR_INVALID;
+		}
+		name[pathLen-1] = '\0';
+		--pathLen;
+	}
+	char* path = name;
+	char* tmp = strrchr(name, '/');
+	if (tmp) {
+		name = tmp + 1;
+		*tmp = '\0';
+	}
+	if (path != name) {
+		openDir(path, &rootDir);
+	}
 	int nameSize = strlen(name);
-	if (nameSize > MAX_FILENAME_SIZE) {
+	if (nameSize == 0) {
+		return ERR_INVALID;
+	} else if (nameSize > MAX_FILENAME_SIZE) {
 		return ERR_NAMETOOLONG;
 	}
 	int err, idx;
 	File file = {0};
 	memcpy(file.name, name, nameSize);
 	int bNum = findFile(&file);
-	if (bNum < 0) {
+	if (IS_TFS_ERROR(bNum)) {
+		return bNum;
+	} else if (bNum == 0) {
+		dbg("file not found!\n");
+		file.buf.data[1] = 0x44;
 		idx = BLOCK_HEADER_SIZE;
+		file.buf.data[idx] = rootDir.inode;
+		idx += 1;
 		memcpy(file.buf.data+idx, file.name, MAX_FILENAME_SIZE);
 		idx += MAX_FILENAME_SIZE;
+		file.buf.data[idx] = FLAGS_RDWR;
+		idx += 1;
 		memset(file.buf.data+idx, 0, BLOCKSIZE-idx);
 		if ((bNum = nextFreeBlock()) <= 0) {
 			return ERR_NOMEMORY;
@@ -219,17 +548,12 @@ fileDescriptor tfs_openFile(char* name) {
 		if (IS_TFS_ERROR(err)) {
 			return err;
 		}
+		file.buf.bNum = bNum;
+		file.inode = bNum;
+		file.dir = rootDir.inode;
+		file.flags = FLAGS_RDWR;
 		bitset_clear(superBlock.data+5, bNum);
-	} else {
-		idx = BLOCK_HEADER_SIZE + MAX_FILENAME_SIZE;
-		dbg("size offset: %d\n", idx);
-		file.size = ((uint32_t) file.buf.data[idx])       |
-				    ((uint32_t) file.buf.data[idx+1])<<8  |
-				    ((uint32_t) file.buf.data[idx+2])<<16 |
-				    ((uint32_t) file.buf.data[idx+3])<<24;
 	}
-	file.inode = bNum;
-	file.buf.bNum = bNum;
 	fileDescriptor fd = nextFreeFD();
 	if (fd < 0) {
 		dbg("appending\n");
@@ -243,14 +567,13 @@ fileDescriptor tfs_openFile(char* name) {
 }
 
 int tfs_closeFile(fileDescriptor fd) {
-	if (fd >= fileTable.len) {
-		return ERR_BADF;
-	}
-	File* fp = ((File*) fileTable.ptr) + fd;
-	if (fp->inode <= 0) {
-		return ERR_BADF;
+	File* fp;
+	int err = getFile(fd, &fp);
+	if (IS_TFS_ERROR(err)) {
+		return err;
 	}
 	fp->inode = -1;
+	fp->flags = 0;
 	fp->buf.bNum = -1;
 	memset(fp->buf.data, 0, BLOCKSIZE);
 	if (nextFD < 0) {
@@ -283,19 +606,30 @@ int freeBlocks(File* fp, int bNum) {
 	return 0;
 }
 
+
 int tfs_writeFile(fileDescriptor fd, char* buffer, int size) {
-	if (fd >= fileTable.len) {
-		return ERR_BADF;
+	File* fp;
+	int err = getFile(fd, &fp);
+	if (IS_TFS_ERROR(err)) {
+		dbg("error getting file\n");
+		return err;
+	} else if ((fp->flags & FLAG_ISDIR)) {
+		dbg("file is dir\n");
+		return ERR_ISDIR;
+	} else if ((fp->flags & FLAG_WRITE) == 0) {
+		dbg("no write access\n");
+		return ERR_ACCESS;
+	} else if (size > fp->size) {
+		int need = blockNum(size-1) - blockNum(fp->size-1);
+		int have = bitset_popcnt(superBlock.data+5, superBlock.data[4]);
+		if (need > have) {
+			return ERR_NOMEMORY;
+		}
 	}
-	File* fp = ((File*) fileTable.ptr) + fd;
-	int bNum = fp->inode;
-	if (bNum <= 0) {
-		return ERR_BADF;
-	}
-	int next;
 	fp->size = size;
-	int err, off = BLOCK_HEADER_SIZE;
+	int off = BLOCK_HEADER_SIZE;
 	int n, nBytes = BLOCK_DATA_SIZE;
+	int next, bNum = fp->inode;
 	while (size > 0 && bNum > 0) {
 		err = readBlock(mnt, bNum, fp->buf.data);
 		if (IS_TFS_ERROR(err)) {
@@ -357,14 +691,16 @@ int tfs_writeFile(fileDescriptor fd, char* buffer, int size) {
 }
 
 int tfs_deleteFile(fileDescriptor fd) {
-	if (fd >= fileTable.len) {
-		return ERR_BADF;
+	File* fp;
+	int err = getFile(fd, &fp);
+	if (IS_TFS_ERROR(err)) {
+		return err;
+	} else if ((fp->flags & FLAG_ISDIR)) {
+		return ERR_ISDIR;
+	} else if ((fp->flags & FLAG_WRITE) == 0) {
+		return ERR_ACCESS;
 	}
-	File* fp = ((File*) fileTable.ptr) + fd;
-	if (fp->inode <= 0) {
-		return ERR_BADF;
-	}
-	int err = freeBlocks(fp, fp->inode);
+	err = freeBlocks(fp, fp->inode);
 	if (IS_TFS_ERROR(err)) {
 		return err;
 	}
@@ -373,67 +709,73 @@ int tfs_deleteFile(fileDescriptor fd) {
 
 int tfs_readByte(fileDescriptor fd, char* buffer) {
 	dbg("reading byte\n");
-	if (fd >= fileTable.len) {
-		dbg("bad fd %d\n", fd);
-		return ERR_BADF;
-	}
-	File* fp = ((File*) fileTable.ptr) + fd;
-	if (fp->inode <= 0) {
-		dbg("bad inode %d\n", fp->inode);
-		return ERR_BADF;
-	}
-	dbg("reading byte %d\n", fp->ptr);
-	if (fp->ptr >= fp->size) {
-		dbg("bad ptr %d (size %d)\n", fp->ptr, fp->size);
+	File* fp;
+	int err = getFile(fd, &fp);
+	if (IS_TFS_ERROR(err)) {
+		return err;
+	} else if (fp->flags & FLAG_ISDIR) {
+		return ERR_ISDIR;
+	} else if (fp->ptr >= fp->size) {
 		return ERR_FAULT;
 	}
-	int err;
-	if (fp->ptr == 0 && fp->buf.bNum != fp->inode) {
-		err = readBlock(mnt, fp->inode, fp->buf.data);
-		if (IS_TFS_ERROR(err)) {
-			return err;
-		}
-		fp->buf.bNum = fp->inode;
-	}
-	int off, idx = fp->ptr;
-	if (idx < INODE_DATA_SIZE) {
-		off = INODE_HEADER_SIZE;
-	} else {
-		idx = (fp->ptr - INODE_DATA_SIZE) % BLOCK_DATA_SIZE;
-		off = BLOCK_HEADER_SIZE;
-	}
-	idx += off;
+	int off;
+	int idx = ptrIndex(fp->ptr, &off);
 	dbg("off: %d, idx: %d\n", off, idx);
-	*buffer = fp->buf.data[idx];
-	if (idx >= BLOCKSIZE - 1) {
+	if (idx == off) {
 		// Read next block of file
-		int next = fp->buf.data[2];
-		dbg("Read next block %d\n", next);
-		if (next <= 0) {
+		int bNum = (fp->ptr == 0) ? fp->inode : fp->buf.data[2];
+		if (bNum <= 0) {
 			return ERR_FAULT;
 		}
-		err = readBlock(mnt, next, fp->buf.data);
+		dbg("Reading next block %d\n", bNum);
+		err = readBlock(mnt, bNum, fp->buf.data);
 		if (IS_TFS_ERROR(err)) {
 			return err;
 		}
-		fp->buf.bNum = next;
+		fp->buf.bNum = bNum;
 	}
+
+	dbg("block[%d] = '%c'\n", idx, fp->buf.data[idx]);
+	*buffer = fp->buf.data[idx];
 	++fp->ptr;
 	return 0;
 }
 
-int tfs_seek(fileDescriptor fd, int offset) {
-	if (fd >= fileTable.len) {
-		return ERR_BADF;
-	}
-	File* fp = ((File*) fileTable.ptr) + fd;
-	if (fp->inode <= 0) {
-		return ERR_BADF;
-	}
-	if (offset == fp->ptr) {
+int _tfs_seek(File* fp, int offset) {
+	if (offset >= fp->size) {
+		fp->ptr = offset;
 		return 0;
-	} else if (offset >= fp->size) {
-		return ERR_OVERFLOW;
 	}
+	int ptrBlock = blockNum(fp->ptr);
+	int offBlock = blockNum(offset);
+	int bNum, nBlocks;
+	if (offBlock < ptrBlock) {
+		bNum = fp->inode;
+		nBlocks = offBlock + 1;
+	} else {
+		bNum = fp->buf.data[2];
+		nBlocks = offBlock - ptrBlock;
+	}
+	int err;
+	while (bNum > 0 && nBlocks > 0) {
+		err = readBlock(mnt, bNum, fp->buf.data);
+		if (IS_TFS_ERROR(err)) {
+			return err;
+		}
+		fp->buf.bNum = bNum;
+		bNum = fp->buf.data[2];
+		nBlocks -= 1;
+	}
+	fp->ptr = offset;
 	return 0;
 }
+
+int tfs_seek(fileDescriptor fd, int offset) {
+	File* fp;
+	int err = getFile(fd, &fp);
+	if (IS_TFS_ERROR(err)) {
+		return err;
+	}
+	return _tfs_seek(fp, offset);
+}
+

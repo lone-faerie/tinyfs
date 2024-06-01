@@ -15,5 +15,7 @@ int bitset_next_clear(uint8_t* set, int size, int idx);
 int bitset_ctz(uint8_t* set, int size);
 int bitset_next_set(uint8_t* set, int size, int idx);
 
+int bitset_popcnt(uint8_t* set, int size);
+
 //BITSET_H
 #endif

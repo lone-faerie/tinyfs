@@ -66,3 +66,25 @@ int bitset_next_set(uint8_t* set, int size, int idx) {
 	}
 	return -1;
 }
+
+int bitset_popcnt(uint8_t* set, int size) {
+	uint32_t word;
+	int sum = 0;
+	size = (size + 7) >> 3; // num. bytes for size bits
+	for (; size > 4; size -= 4) {
+		word = ((uint32_t) set[0])     |
+			   ((uint32_t) set[1])<<8  |
+			   ((uint32_t) set[2])<<16 |
+			   ((uint32_t) set[3])<<24;
+		sum += __builtin_popcount(word);
+#ifdef DEBUG_FLAG
+		printf("popcnt: %d\n", sum);
+#endif
+		set += 4;
+	}
+	word = 0;
+	for (int i = 0; i < size; i++) {
+		word |= ((uint32_t) set[i])<<(i<<3);
+	}
+	return sum + __builtin_popcount(word);
+}
